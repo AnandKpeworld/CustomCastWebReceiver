@@ -2,189 +2,127 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
   <title>CastConnect Receiver</title>
 
-  <!-- Google Cast Application Framework (CAF) Receiver SDK -->
+  <!-- Google Cast Application Framework (CAF) receiver -->
   <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
   <!-- YouTube IFrame Player API -->
   <script src="https://www.youtube.com/iframe_api"></script>
 
   <style>
     html, body {
-      margin: 0;
-      padding: 0;
-      width: 100%;
-      height: 100%;
-      background: #000;
-      overflow: hidden;
-      font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      width: 100%; height: 100%; margin: 0; padding: 0;
+      background: #000; overflow: hidden;
     }
-
-    /* Standard media (local video + photos) is rendered here by CAF. */
+    /* CAF's media player: gallery video, IPTV, photos, app logo. */
     cast-media-player {
-      --background-color: #000;
-      --splash-image: url("https://pub-6ddfb204d1334b9e850ae2f6d020ba9c.r2.dev/ams/Frame_62.png");
-      --splash-size: contain;
-      width: 100%;
-      height: 100%;
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
     }
-
-    /* Photo layer — CAF shows images inside cast-media-player, but for a clean
-       "contain, centered on black" look we also expose an explicit photo layer
-       the LOAD interceptor can use when needed. */
-    #photoLayer {
-      position: absolute;
-      inset: 0;
-      display: none;
-      align-items: center;
-      justify-content: center;
-      background: #000;
-      z-index: 5;
+    /* YouTube IFrame overlay — shown only while a YouTube video is playing. */
+    #yt-layer {
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      background: #000; display: none; z-index: 10;
     }
-    #photoLayer img {
-      max-width: 100%;
-      max-height: 100%;
-      object-fit: contain;
-    }
-
-    /* YouTube layer sits above everything when a YouTube video is flung. */
-    #ytLayer {
-      position: absolute;
-      inset: 0;
-      display: none;
-      background: #000;
-      z-index: 10;
-    }
-    #ytPlayer {
-      width: 100%;
-      height: 100%;
-    }
-
-    /* Idle / branding splash shown when nothing is playing. */
-    #idleLayer {
-      position: absolute;
-      inset: 0;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      background: #000;
-      z-index: 1;
-    }
-    #idleLayer img {
-      max-width: 55%;
-      max-height: 55%;
-      object-fit: contain;
-      opacity: 0.95;
-    }
+    #yt-player { width: 100%; height: 100%; border: 0; }
   </style>
 </head>
 <body>
-  <!-- Branding splash (idle) -->
-  <div id="idleLayer">
-    <img src="https://pub-6ddfb204d1334b9e850ae2f6d020ba9c.r2.dev/ams/Frame_62.png" alt="CastConnect">
-  </div>
-
-  <!-- Standard media player (local videos + photos via CAF) -->
+  <!-- Plays everything that arrives via loadMedia(): gallery videos, IPTV, photos -->
   <cast-media-player></cast-media-player>
 
-  <!-- Explicit photo layer (optional path) -->
-  <div id="photoLayer"><img id="photoImg" src="" alt=""></div>
-
-  <!-- YouTube layer -->
-  <div id="ytLayer"><div id="ytPlayer"></div></div>
+  <!-- Plays YouTube via the real IFrame player (driven by the app's custom channel) -->
+  <div id="yt-layer"><div id="yt-player"></div></div>
 
   <script>
     /* =====================================================================
        CastConnect — Custom Web Receiver
-       Plays: local videos (mp4), photos (jpeg/png), and YouTube videos.
 
-       - Local video & photo: standard CAF LOAD via the sender's
-         remoteMediaClient.loadMedia(...). Rendered by <cast-media-player>.
-       - YouTube: driven over a custom message namespace from the sender,
-         and played with the YouTube IFrame Player API (so it stays inside
-         THIS receiver instead of flinging to the official YouTube app).
+       Plays local video / IPTV / photos through the standard CAF media player,
+       and YouTube through the real YouTube IFrame Player API.
+
+       The iOS app (CastManager.swift) talks to this receiver over a custom
+       namespace. Messages are JSON:
+
+         App  -> receiver:
+           { "action":"play",   "videoId":"<id>" }   load + play a YouTube video
+           { "action":"pause" }                       pause
+           { "action":"resume" }                      resume
+           { "action":"seek",   "seconds": 10 }       skip ±10s (relative)
+           { "action":"seekTo", "seconds": 90 }       jump to absolute position
+           { "action":"stop" }                        stop, hide YouTube overlay
+
+         Receiver -> app (reported on the same namespace, keyed by "type" so it
+         never collides with the app's "action" messages):
+           { "type":"status", "time":12.3, "duration":210, "state":1 }  ~1/sec
+           { "type":"ended" }                                           video finished
+
+       NOTE: addCustomMessageListener is the correct CAF v3 API. The older
+       getCustomMessageBus() does NOT exist in CAF v3 — calling it throws and the
+       receiver disconnects ("Disconnected from receiver"). Do not use it.
        ===================================================================== */
 
-    const NAMESPACE = 'urn:x-cast:com.castconnect.receiver';
-
-    const idleLayer  = document.getElementById('idleLayer');
-    const photoLayer = document.getElementById('photoLayer');
-    const photoImg   = document.getElementById('photoImg');
-    const ytLayer    = document.getElementById('ytLayer');
+    // MUST match CastReceiverConfig.namespace in the iOS app exactly.
+    const YT_NAMESPACE = 'urn:x-cast:zb.ScreenMirroring.CastifyTV.youtube';
 
     const context = cast.framework.CastReceiverContext.getInstance();
     const playerManager = context.getPlayerManager();
 
-    // ----- Layer visibility helpers --------------------------------------
+    const ytLayer = document.getElementById('yt-layer');
+    let ytPlayer = null;        // the YouTube IFrame player instance
+    let ytReady = false;        // YouTube IFrame API finished loading
+    let pendingVideoId = null;  // a play() that arrived before the API was ready
+    let statusTimer = null;     // periodic position reporter
 
-    function showIdle() {
-      idleLayer.style.display  = 'flex';
-      photoLayer.style.display = 'none';
-      ytLayer.style.display    = 'none';
+    // ---- YouTube layer helpers ------------------------------------------------
+    function showYouTube() { ytLayer.style.display = 'block'; }
+    function hideYouTube() {
+      ytLayer.style.display = 'none';
+      stopStatusReports();
+      if (ytPlayer && ytPlayer.stopVideo) {
+        try { ytPlayer.stopVideo(); } catch (e) {}
+      }
     }
 
-    function showMediaPlayer() {
-      // CAF media player is always in the DOM; just make sure our overlays
-      // are out of the way so video/photo from CAF is visible.
-      idleLayer.style.display  = 'none';
-      photoLayer.style.display = 'none';
-      ytLayer.style.display    = 'none';
+    // Broadcast a JSON message back to the app on our namespace.
+    function notifyApp(message) {
+      try { context.sendCustomMessage(YT_NAMESPACE, undefined, message); } catch (e) {}
     }
 
-    function showYouTube() {
-      idleLayer.style.display  = 'none';
-      photoLayer.style.display = 'none';
-      ytLayer.style.display    = 'block';
+    function startStatusReports() {
+      stopStatusReports();
+      statusTimer = setInterval(function () {
+        if (!ytPlayer || !ytReady || ytLayer.style.display !== 'block') return;
+        try {
+          notifyApp({
+            type: 'status',
+            time: ytPlayer.getCurrentTime() || 0,
+            duration: ytPlayer.getDuration() || 0,
+            state: ytPlayer.getPlayerState()   // 1=playing 2=paused 3=buffering 0=ended
+          });
+        } catch (e) {}
+      }, 1000);
+    }
+    function stopStatusReports() {
+      if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
     }
 
-    // ----- YouTube IFrame player -----------------------------------------
-
-    let ytPlayer = null;
-    let ytReady  = false;
-    let pendingYouTubeId = null;
-
-    // Called automatically by the YouTube IFrame API once it has loaded.
+    // Called automatically by the IFrame API once it has loaded.
     window.onYouTubeIframeAPIReady = function () {
-      ytPlayer = new YT.Player('ytPlayer', {
-        width: '100%',
-        height: '100%',
+      ytPlayer = new YT.Player('yt-player', {
+        width: '100%', height: '100%',
         playerVars: {
-          autoplay: 1,
-          controls: 0,
-          rel: 0,
-          fs: 0,
-          modestbranding: 1,
-          playsinline: 1,
-          iv_load_policy: 3
+          autoplay: 1, controls: 1, rel: 0, fs: 1,
+          playsinline: 1, modestbranding: 1, iv_load_policy: 3
         },
         events: {
           onReady: function () {
             ytReady = true;
-            // Report playback position/duration to the sender once a second so
-            // the app's on-screen progress bar can track playback live.
-            setInterval(reportYouTubeStatus, 1000);
-            if (pendingYouTubeId) {
-              const id = pendingYouTubeId;
-              pendingYouTubeId = null;
-              playYouTube(id);
-            }
+            if (pendingVideoId) { playYouTube(pendingVideoId); pendingVideoId = null; }
           },
           onStateChange: function (e) {
-            // When a YouTube video ends, tell the sender so it can auto-advance
-            // to the next video in the list. If the sender doesn't load another
-            // one shortly, fall back to the branding splash.
             if (e.data === YT.PlayerState.ENDED) {
-              notifySender({ type: 'YT_ENDED' });
-              const endedAt = Date.now();
-              setTimeout(function () {
-                // Only idle if nothing new started playing in the meantime.
-                if (ytPlayer && ytReady &&
-                    ytPlayer.getPlayerState() === YT.PlayerState.ENDED &&
-                    Date.now() - endedAt >= 1500) {
-                  showIdle();
-                }
-              }, 1600);
+              notifyApp({ type: 'ended' });   // app auto-advances to next video
             }
           }
         }
@@ -193,173 +131,76 @@
 
     function playYouTube(videoId) {
       if (!videoId) return;
-      // Stop any standard media so audio doesn't overlap.
-      try { playerManager.stop(); } catch (_) {}
+      // A YouTube request takes over the screen: stop any CAF media first.
+      try { playerManager.stop(); } catch (e) {}
       showYouTube();
-      if (!ytReady || !ytPlayer) {
-        pendingYouTubeId = videoId;     // play as soon as the API is ready
-        return;
-      }
+      if (!ytReady || !ytPlayer) { pendingVideoId = videoId; return; }
       ytPlayer.loadVideoById(videoId);
       ytPlayer.playVideo();
+      startStatusReports();
     }
 
-    function stopYouTube() {
-      if (ytPlayer && ytReady) {
-        try { ytPlayer.stopVideo(); } catch (_) {}
+    // ---- Custom channel: messages from the iOS app ----------------------------
+    context.addCustomMessageListener(YT_NAMESPACE, function (event) {
+      // event.data may be an object (JSON namespace) or a JSON string — handle both.
+      let data = event.data || {};
+      if (typeof data === 'string') {
+        try { data = JSON.parse(data); } catch (e) { data = {}; }
       }
-    }
-
-    // Broadcast a JSON message back to the sender(s) on our namespace.
-    function notifySender(message) {
-      try { context.sendCustomMessage(NAMESPACE, undefined, message); } catch (_) {}
-    }
-
-    // Push the current YouTube position/duration/state to the sender. No-op
-    // unless a YouTube video is actually on screen and the player is ready.
-    function reportYouTubeStatus() {
-      if (!ytPlayer || !ytReady) return;
-      if (ytLayer.style.display !== 'block') return;
-      try {
-        notifySender({
-          type: 'YT_STATUS',
-          time: ytPlayer.getCurrentTime() || 0,
-          duration: ytPlayer.getDuration() || 0,
-          state: ytPlayer.getPlayerState()   // 1=playing 2=paused 3=buffering 0=ended
-        });
-      } catch (_) {}
-    }
-
-    // ----- Custom message channel (YouTube control from the sender) -------
-    /*
-       Message shapes the iOS sender sends on NAMESPACE:
-         { "type": "LOAD_YT", "videoId": "dQw4w9WgXcQ" }
-         { "type": "PLAY" }
-         { "type": "PAUSE" }
-         { "type": "SEEK", "seconds": 30 }      // absolute position
-         { "type": "STOP" }
-    */
-    context.addCustomMessageListener(NAMESPACE, function (event) {
-      const data = event.data || {};
-      switch (data.type) {
-        case 'LOAD_YT':
+      switch (data.action) {
+        case 'play':
           playYouTube(data.videoId);
           break;
-        case 'PLAY':
-          if (ytLayer.style.display === 'block') {
-            if (ytPlayer && ytReady) ytPlayer.playVideo();
-          } else {
-            playerManager.play();
+        case 'pause':
+          if (ytPlayer && ytPlayer.pauseVideo) ytPlayer.pauseVideo();
+          break;
+        case 'resume':
+          if (ytPlayer && ytPlayer.playVideo) ytPlayer.playVideo();
+          break;
+        case 'seek':
+          if (ytPlayer && ytPlayer.seekTo && ytPlayer.getCurrentTime) {
+            let target = ytPlayer.getCurrentTime() + (Number(data.seconds) || 0);
+            if (target < 0) target = 0;
+            ytPlayer.seekTo(target, true);
           }
           break;
-        case 'PAUSE':
-          if (ytLayer.style.display === 'block') {
-            if (ytPlayer && ytReady) ytPlayer.pauseVideo();
-          } else {
-            playerManager.pause();
+        case 'seekTo':
+          if (ytPlayer && ytPlayer.seekTo) {
+            ytPlayer.seekTo(Math.max(0, Number(data.seconds) || 0), true);
           }
           break;
-        case 'SEEK':
-          if (ytLayer.style.display === 'block' && ytPlayer && ytReady) {
-            const secs = Number(data.seconds) || 0;
-            if (data.relative) {
-              // ±10s relative to the receiver's actual current position.
-              const target = Math.max(0, ytPlayer.getCurrentTime() + secs);
-              ytPlayer.seekTo(target, true);
-            } else {
-              ytPlayer.seekTo(secs, true);   // absolute position
-            }
-          }
-          break;
-        case 'STOP':
-          stopYouTube();
-          showIdle();
+        case 'stop':
+          hideYouTube();
           break;
         default:
+          // Tolerate a bare { videoId } too.
+          if (data.videoId) playYouTube(data.videoId);
           break;
       }
     });
 
-    // ----- LOAD interceptor (local video + photo, and YT-by-URL fallback) -
-    /*
-       Runs for every standard media LOAD from the sender. We use it to:
-         1. Detect a YouTube load that came through as media (contentType
-            "video/youtube" or a youtube.com/youtu.be URL, or customData with
-            a youtubeId) and reroute it to the IFrame player.
-         2. Make sure the YouTube overlay is hidden for genuine local media.
-    */
+    // ---- CAF media: hide the YouTube layer whenever real media loads ----------
+    // Any loadMedia() from the app (gallery video, IPTV, photo, logo) reclaims
+    // the screen.
     playerManager.setMessageInterceptor(
       cast.framework.messages.MessageType.LOAD,
-      function (request) {
-        try {
-          const media = request.media || {};
-          const url = media.contentUrl || media.contentId || '';
-          const custom = media.customData || {};
-          const ct = (media.contentType || '').toLowerCase();
-
-          const ytId =
-            custom.youtubeId ||
-            custom.videoId ||
-            extractYouTubeId(url) ||
-            (ct === 'video/youtube' ? extractYouTubeId(url) : null);
-
-          if (ytId) {
-            // Handle as YouTube, reject the default media load.
-            playYouTube(ytId);
-            return null;            // null => CAF aborts the default LOAD
-          }
-
-          // Genuine local media: hide overlays, let CAF play it.
-          stopYouTube();
-          showMediaPlayer();
-        } catch (e) {
-          // Never block a load because of our own bookkeeping.
-        }
-        return request;             // proceed with standard CAF playback
+      function (loadRequest) {
+        hideYouTube();
+        return loadRequest;
       }
     );
 
-    function extractYouTubeId(url) {
-      if (!url) return null;
-      const patterns = [
-        /[?&]v=([^&#]+)/,
-        /youtu\.be\/([^?&#/]+)/,
-        /embed\/([^?&#/]+)/
-      ];
-      for (const re of patterns) {
-        const m = url.match(re);
-        if (m && m[1]) return m[1];
-      }
-      return null;
-    }
-
-    // ----- Player lifecycle: drop to splash when idle --------------------
-
-    playerManager.addEventListener(
-      cast.framework.events.EventType.MEDIA_FINISHED,
-      function () {
-        // Only fall back to idle if YouTube isn't currently on screen.
-        if (ytLayer.style.display !== 'block') showIdle();
-      }
-    );
-
-    playerManager.addEventListener(
-      cast.framework.events.EventType.PLAYER_LOAD_COMPLETE,
-      function () { showMediaPlayer(); }
-    );
-
-    // ----- Start the receiver --------------------------------------------
-
+    // ---- Start the receiver ---------------------------------------------------
     const options = new cast.framework.CastReceiverOptions();
-    // Keep the receiver alive briefly between items so back-to-back casts
-    // (e.g. gallery auto-advance) don't tear the session down.
-    options.maxInactivity = 3600;          // seconds
+    // Keep the receiver alive when idle so the app can switch between YouTube and
+    // local media without the session dropping.
+    options.disableIdleTimeout = true;
+    // Advertise our custom namespace so the SDK routes the app's messages here.
     options.customNamespaces = {};
-    options.customNamespaces[NAMESPACE] =
-      cast.framework.system.MessageType.JSON;
+    options.customNamespaces[YT_NAMESPACE] = cast.framework.system.MessageType.JSON;
 
-    showIdle();
     context.start(options);
+    console.log('CastConnect receiver started (media + YouTube IFrame)');
   </script>
 </body>
 </html>
