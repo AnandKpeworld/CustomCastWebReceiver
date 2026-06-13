@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <title>CastConnect Receiver</title>
+
+  <!-- Google Cast Application Framework (CAF) Receiver SDK -->
+  <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+  <!-- YouTube IFrame Player API -->
+  <script src="https://www.youtube.com/iframe_api"></script>
+
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: #000;
+      overflow: hidden;
+      font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+
+    /* Standard media (local video + photos) is rendered here by CAF. */
+    cast-media-player {
+      --background-color: #000;
+      --splash-image: url("https://pub-6ddfb204d1334b9e850ae2f6d020ba9c.r2.dev/ams/Frame_62.png");
+      --splash-size: contain;
+      width: 100%;
+      height: 100%;
+    }
+
+    /* Photo layer — CAF shows images inside cast-media-player, but for a clean
+       "contain, centered on black" look we also expose an explicit photo layer
+       the LOAD interceptor can use when needed. */
+    #photoLayer {
+      position: absolute;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: #000;
+      z-index: 5;
+    }
+    #photoLayer img {
+      max-width: 100%;
+      max-height: 100%;
+      object-fit: contain;
+    }
+
+    /* YouTube layer sits above everything when a YouTube video is flung. */
+    #ytLayer {
+      position: absolute;
+      inset: 0;
+      display: none;
+      background: #000;
+      z-index: 10;
+    }
+    #ytPlayer {
+      width: 100%;
+      height: 100%;
+    }
+
+    /* Idle / branding splash shown when nothing is playing. */
+    #idleLayer {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #000;
+      z-index: 1;
+    }
+    #idleLayer img {
+      max-width: 55%;
+      max-height: 55%;
+      object-fit: contain;
+      opacity: 0.95;
+    }
+  </style>
+</head>
+<body>
+  <!-- Branding splash (idle) -->
+  <div id="idleLayer">
+    <img src="https://pub-6ddfb204d1334b9e850ae2f6d020ba9c.r2.dev/ams/Frame_62.png" alt="CastConnect">
+  </div>
+
+  <!-- Standard media player (local videos + photos via CAF) -->
+  <cast-media-player></cast-media-player>
+
+  <!-- Explicit photo layer (optional path) -->
+  <div id="photoLayer"><img id="photoImg" src="" alt=""></div>
+
+  <!-- YouTube layer -->
+  <div id="ytLayer"><div id="ytPlayer"></div></div>
+
+  <script>
+    /* =====================================================================
+       CastConnect — Custom Web Receiver
+       Plays: local videos (mp4), photos (jpeg/png), and YouTube videos.
+
+       - Local video & photo: standard CAF LOAD via the sender's
+         remoteMediaClient.loadMedia(...). Rendered by <cast-media-player>.
+       - YouTube: driven over a custom message namespace from the sender,
+         and played with the YouTube IFrame Player API (so it stays inside
+         THIS receiver instead of flinging to the official YouTube app).
+       ===================================================================== */
+
+    const NAMESPACE = 'urn:x-cast:com.castconnect.receiver';
+
+    const idleLayer  = document.getElementById('idleLayer');
+    const photoLayer = document.getElementById('photoLayer');
+    const photoImg   = document.getElementById('photoImg');
+    const ytLayer    = document.getElementById('ytLayer');
+
+    const context = cast.framework.CastReceiverContext.getInstance();
+    const playerManager = context.getPlayerManager();
+
+    // ----- Layer visibility helpers --------------------------------------
+
+    function showIdle() {
+      idleLayer.style.display  = 'flex';
+      photoLayer.style.display = 'none';
+      ytLayer.style.display    = 'none';
+    }
+
+    function showMediaPlayer() {
+      // CAF media player is always in the DOM; just make sure our overlays
+      // are out of the way so video/photo from CAF is visible.
+      idleLayer.style.display  = 'none';
+      photoLayer.style.display = 'none';
+      ytLayer.style.display    = 'none';
+    }
+
+    function showYouTube() {
+      idleLayer.style.display  = 'none';
+      photoLayer.style.display = 'none';
+      ytLayer.style.display    = 'block';
+    }
+
+    // ----- YouTube IFrame player -----------------------------------------
+
+    let ytPlayer = null;
+    let ytReady  = false;
+    let pendingYouTubeId = null;
+
+    // Called automatically by the YouTube IFrame API once it has loaded.
+    window.onYouTubeIframeAPIReady = function () {
+      ytPlayer = new YT.Player('ytPlayer', {
+        width: '100%',
+        height: '100%',
+        playerVars: {
+          autoplay: 1,
+          controls: 0,
+          rel: 0,
+          fs: 0,
+          modestbranding: 1,
+          playsinline: 1,
+          iv_load_policy: 3
+        },
+        events: {
+          onReady: function () {
+            ytReady = true;
+            if (pendingYouTubeId) {
+              const id = pendingYouTubeId;
+              pendingYouTubeId = null;
+              playYouTube(id);
+            }
+          },
+          onStateChange: function (e) {
+            // When a YouTube video ends, tell the sender so it can auto-advance
+            // to the next video in the list. If the sender doesn't load another
+            // one shortly, fall back to the branding splash.
+            if (e.data === YT.PlayerState.ENDED) {
+              notifySender({ type: 'YT_ENDED' });
+              const endedAt = Date.now();
+              setTimeout(function () {
+                // Only idle if nothing new started playing in the meantime.
+                if (ytPlayer && ytReady &&
+                    ytPlayer.getPlayerState() === YT.PlayerState.ENDED &&
+                    Date.now() - endedAt >= 1500) {
+                  showIdle();
+                }
+              }, 1600);
+            }
+          }
+        }
+      });
+    };
+
+    function playYouTube(videoId) {
+      if (!videoId) return;
+      // Stop any standard media so audio doesn't overlap.
+      try { playerManager.stop(); } catch (_) {}
+      showYouTube();
+      if (!ytReady || !ytPlayer) {
+        pendingYouTubeId = videoId;     // play as soon as the API is ready
+        return;
+      }
+      ytPlayer.loadVideoById(videoId);
+      ytPlayer.playVideo();
+    }
+
+    function stopYouTube() {
+      if (ytPlayer && ytReady) {
+        try { ytPlayer.stopVideo(); } catch (_) {}
+      }
+    }
+
+    // Broadcast a JSON message back to the sender(s) on our namespace.
+    function notifySender(message) {
+      try { context.sendCustomMessage(NAMESPACE, undefined, message); } catch (_) {}
+    }
+
+    // ----- Custom message channel (YouTube control from the sender) -------
+    /*
+       Message shapes the iOS sender sends on NAMESPACE:
+         { "type": "LOAD_YT", "videoId": "dQw4w9WgXcQ" }
+         { "type": "PLAY" }
+         { "type": "PAUSE" }
+         { "type": "SEEK", "seconds": 30 }      // absolute position
+         { "type": "STOP" }
+    */
+    context.addCustomMessageListener(NAMESPACE, function (event) {
+      const data = event.data || {};
+      switch (data.type) {
+        case 'LOAD_YT':
+          playYouTube(data.videoId);
+          break;
+        case 'PLAY':
+          if (ytLayer.style.display === 'block') {
+            if (ytPlayer && ytReady) ytPlayer.playVideo();
+          } else {
+            playerManager.play();
+          }
+          break;
+        case 'PAUSE':
+          if (ytLayer.style.display === 'block') {
+            if (ytPlayer && ytReady) ytPlayer.pauseVideo();
+          } else {
+            playerManager.pause();
+          }
+          break;
+        case 'SEEK':
+          if (ytLayer.style.display === 'block' && ytPlayer && ytReady) {
+            const secs = Number(data.seconds) || 0;
+            if (data.relative) {
+              // ±10s relative to the receiver's actual current position.
+              const target = Math.max(0, ytPlayer.getCurrentTime() + secs);
+              ytPlayer.seekTo(target, true);
+            } else {
+              ytPlayer.seekTo(secs, true);   // absolute position
+            }
+          }
+          break;
+        case 'STOP':
+          stopYouTube();
+          showIdle();
+          break;
+        default:
+          break;
+      }
+    });
+
+    // ----- LOAD interceptor (local video + photo, and YT-by-URL fallback) -
+    /*
+       Runs for every standard media LOAD from the sender. We use it to:
+         1. Detect a YouTube load that came through as media (contentType
+            "video/youtube" or a youtube.com/youtu.be URL, or customData with
+            a youtubeId) and reroute it to the IFrame player.
+         2. Make sure the YouTube overlay is hidden for genuine local media.
+    */
+    playerManager.setMessageInterceptor(
+      cast.framework.messages.MessageType.LOAD,
+      function (request) {
+        try {
+          const media = request.media || {};
+          const url = media.contentUrl || media.contentId || '';
+          const custom = media.customData || {};
+          const ct = (media.contentType || '').toLowerCase();
+
+          const ytId =
+            custom.youtubeId ||
+            custom.videoId ||
+            extractYouTubeId(url) ||
+            (ct === 'video/youtube' ? extractYouTubeId(url) : null);
+
+          if (ytId) {
+            // Handle as YouTube, reject the default media load.
+            playYouTube(ytId);
+            return null;            // null => CAF aborts the default LOAD
+          }
+
+          // Genuine local media: hide overlays, let CAF play it.
+          stopYouTube();
+          showMediaPlayer();
+        } catch (e) {
+          // Never block a load because of our own bookkeeping.
+        }
+        return request;             // proceed with standard CAF playback
+      }
+    );
+
+    function extractYouTubeId(url) {
+      if (!url) return null;
+      const patterns = [
+        /[?&]v=([^&#]+)/,
+        /youtu\.be\/([^?&#/]+)/,
+        /embed\/([^?&#/]+)/
+      ];
+      for (const re of patterns) {
+        const m = url.match(re);
+        if (m && m[1]) return m[1];
+      }
+      return null;
+    }
+
+    // ----- Player lifecycle: drop to splash when idle --------------------
+
+    playerManager.addEventListener(
+      cast.framework.events.EventType.MEDIA_FINISHED,
+      function () {
+        // Only fall back to idle if YouTube isn't currently on screen.
+        if (ytLayer.style.display !== 'block') showIdle();
+      }
+    );
+
+    playerManager.addEventListener(
+      cast.framework.events.EventType.PLAYER_LOAD_COMPLETE,
+      function () { showMediaPlayer(); }
+    );
+
+    // ----- Start the receiver --------------------------------------------
+
+    const options = new cast.framework.CastReceiverOptions();
+    // Keep the receiver alive briefly between items so back-to-back casts
+    // (e.g. gallery auto-advance) don't tear the session down.
+    options.maxInactivity = 3600;          // seconds
+    options.customNamespaces = {};
+    options.customNamespaces[NAMESPACE] =
+      cast.framework.system.MessageType.JSON;
+
+    showIdle();
+    context.start(options);
+  </script>
+</body>
+</html>
