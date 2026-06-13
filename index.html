@@ -161,6 +161,9 @@
         events: {
           onReady: function () {
             ytReady = true;
+            // Report playback position/duration to the sender once a second so
+            // the app's on-screen progress bar can track playback live.
+            setInterval(reportYouTubeStatus, 1000);
             if (pendingYouTubeId) {
               const id = pendingYouTubeId;
               pendingYouTubeId = null;
@@ -210,6 +213,21 @@
     // Broadcast a JSON message back to the sender(s) on our namespace.
     function notifySender(message) {
       try { context.sendCustomMessage(NAMESPACE, undefined, message); } catch (_) {}
+    }
+
+    // Push the current YouTube position/duration/state to the sender. No-op
+    // unless a YouTube video is actually on screen and the player is ready.
+    function reportYouTubeStatus() {
+      if (!ytPlayer || !ytReady) return;
+      if (ytLayer.style.display !== 'block') return;
+      try {
+        notifySender({
+          type: 'YT_STATUS',
+          time: ytPlayer.getCurrentTime() || 0,
+          duration: ytPlayer.getDuration() || 0,
+          state: ytPlayer.getPlayerState()   // 1=playing 2=paused 3=buffering 0=ended
+        });
+      } catch (_) {}
     }
 
     // ----- Custom message channel (YouTube control from the sender) -------
